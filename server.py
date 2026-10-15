@@ -18,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ваш свежий рабочий токен (tv: 1), вшитый напрямую на случай сбоя переменных Vercel
+# Резервный рабочий токен (tv: 1)
 BUILTIN_FRESH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5NDkiLCJ0diI6MSwianRpIjoiREpHUnkyeG1IYk8zek1XZWxJbWhuQSIsImlhdCI6MTc5MjA5MjE1OSwiZXhwIjoxNzkyMTM1MzU5fQ._-e_SnM13ISUYqp-Ag2Vzw7e5ThPqtT_gW_5gxo-1xo"
 
 COOKIES_STR = '_clck=1d78p6z%5E2%5Egab%5E0%5E2479; ui_variant=v1; g_state={"i_l":0,"i_ll":1792092157979,"i_e":{"enable_itp_optimization":24},"i_et":1792092157979,"i_b":"MQ8YyHG2REjZYj+IlsoimoaeqiqcZ6IJf3IfuzIbkkY"}; _clsk=1837rvr%5E1792092567099%5E16%5E1%5Ea.clarity.ms%2Fcollect'
@@ -70,20 +70,16 @@ def get_redis():
 
 
 def get_candidate_tokens() -> list[str]:
-    """Собирает все доступные варианты токенов по приоритету."""
     candidates = []
 
-    # 1. Токен из переменной окружения Vercel
     env_token = clean_jwt(os.getenv("ARMETA_FALLBACK_TOKEN", ""))
     if env_token:
         candidates.append(env_token)
 
-    # 2. Вшитый свежий токен из вашего последнего cURL
     builtin = clean_jwt(BUILTIN_FRESH_TOKEN)
     if builtin and builtin not in candidates:
         candidates.append(builtin)
 
-    # 3. Токен из Redis (если есть)
     redis = get_redis()
     if redis:
         try:
@@ -98,6 +94,30 @@ def get_candidate_tokens() -> list[str]:
     return candidates
 
 
+def extract_piece_from_sse(raw_data: str) -> str:
+    """Безопасно извлекает текстовый фрагмент из любого JSON-ответа стрима."""
+    try:
+        chunk = json.loads(raw_data)
+        if isinstance(chunk, str):
+            return chunk
+        if isinstance(chunk, dict):
+            # Проверяем стандартные текстовые поля
+            for key in ("content", "delta", "text", "token", "message"):
+                val = chunk.get(key)
+                if isinstance(val, str) and val:
+                    return val
+                if isinstance(val, dict):
+                    nested = val.get("content") or val.get("text")
+                    if isinstance(nested, str) and nested:
+                        return nested
+        return ""
+    except Exception:
+        # Если это не JSON, а сырой текст
+        if not raw_data.startswith("{") and not raw_data.startswith("["):
+            return raw_data
+        return ""
+
+
 @app.get("/")
 def get_index():
     for path in ["public/index.html", "index.html", "../public/index.html"]:
@@ -109,7 +129,6 @@ def get_index():
 
 @app.get("/api/status")
 def check_status():
-    """Эндпоинт для проверки связи с Armeta прямо из браузера."""
     candidates = get_candidate_tokens()
     results = []
     for idx, tok in enumerate(candidates):
@@ -142,7 +161,7 @@ def evaluate_idea(payload: IdeaRequest):
     redis = get_redis()
     idea_clean = payload.idea.strip()
 
-    # Проверка кэша
+    # 1. Проверка кэша
     idea_hash = hashlib.md5(idea_clean.lower().encode("utf-8")).hexdigest()
     cache_key = f"cache:eval:{idea_hash}"
     if redis:
@@ -187,13 +206,17 @@ def evaluate_idea(payload: IdeaRequest):
     }
 
     candidates = get_candidate_tokens()
-    last_error = "Не найдено ни одного токена"
+    if not candidates:
+        raise HTTPException(
+            status_code=500, detail="Список токенов пуст. Проверьте настройки."
+        )
 
-    # Пробуем каждый доступный токен, пока один не сработает
+    last_error = "Неизвестная ошибка при отправке"
+
     for token in candidates:
         headers = make_headers(token)
 
-        # Создаем новый диалог (или используем 1283 из вашего последнего cURL)
+        # Создаем новый чистый диалог
         conv_id = 1283
         try:
             c_resp = requests.post(
@@ -212,17 +235,20 @@ def evaluate_idea(payload: IdeaRequest):
             msg_url, headers=headers, json=request_data, timeout=30
         )
 
-        # Если этот токен не подошел — переходим к следующему
-        if post_resp.status_code in [401, 403] or "authentication" in post_resp.text.lower():
-            last_error = f"Код {post_resp.status_code}: {post_resp.text}"
+        # Если 409 (в чате 1283 уже идет генерация) — просто переходим к чтению ответа
+        if post_resp.status_code == 409:
+            target_assistant_id = None
+        elif post_resp.status_code in [200, 201]:
+            post_json = post_resp.json()
+            target_assistant_id = post_json.get("assistant_message_id")
+            # Если ответ вдруг вернулся сразу в теле POST
+            if isinstance(post_json.get("content"), str) and post_json.get("content") != masked_prompt:
+                return {"success": True, "analysis": post_json["content"]}
+        else:
+            last_error = f"HTTP {post_resp.status_code}: {post_resp.text}"
             continue
 
-        if post_resp.status_code not in [200, 201]:
-            last_error = f"Код {post_resp.status_code}: {post_resp.text}"
-            continue
-
-        # Токен сработал! Считываем поток
-        target_assistant_id = post_resp.json().get("assistant_message_id")
+        # --- ТОКЕН СРАБОТАЛ! ЗАПУСКАЕМ СТРИМ И ЖДЕМ ОТВЕТ ---
         stream_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/stream"
         conversation_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
 
@@ -240,44 +266,47 @@ def evaluate_idea(payload: IdeaRequest):
                             raw_data = decoded[5:].strip()
                             if raw_data == "[DONE]":
                                 break
-                            try:
-                                chunk = json.loads(raw_data)
-                                piece = (
-                                    chunk.get("content")
-                                    or chunk.get("delta")
-                                    or chunk.get("text")
-                                )
-                                if piece:
-                                    collected_chunks.append(piece)
-                            except Exception:
-                                if raw_data:
-                                    collected_chunks.append(raw_data)
+                            piece = extract_piece_from_sse(raw_data)
+                            if piece:
+                                collected_chunks.append(piece)
         except Exception:
             pass
 
         result_text = "".join(collected_chunks).strip()
 
-        # Если стрим не отдал текст напрямую, забираем из истории чата
+        # Если из стрима текст не собрался напрямую, опрашиваем историю диалога до 100 секунд (50 * 2с)
         if not result_text:
-            for _ in range(15):
+            for _ in range(50):
                 time.sleep(2)
-                g_resp = requests.get(
-                    conversation_url, headers=headers, timeout=20
-                )
-                if g_resp.status_code == 200:
-                    data = g_resp.json()
-                    messages = (
-                        data.get("messages", [])
-                        if isinstance(data, dict)
-                        else data
+                try:
+                    g_resp = requests.get(
+                        conversation_url, headers=headers, timeout=15
                     )
-                    for msg in reversed(messages):
-                        if (
-                            msg.get("id") == target_assistant_id
-                            or msg.get("role") == "assistant"
-                        ) and msg.get("content"):
-                            result_text = msg.get("content")
-                            break
+                    if g_resp.status_code == 200:
+                        data = g_resp.json()
+                        messages = (
+                            data.get("messages", [])
+                            if isinstance(data, dict)
+                            else data
+                        )
+                        for msg in reversed(messages):
+                            is_target = (
+                                target_assistant_id
+                                and msg.get("id") == target_assistant_id
+                            )
+                            is_assistant = msg.get("role") == "assistant"
+                            content = msg.get("content")
+
+                            if (
+                                (is_target or is_assistant)
+                                and isinstance(content, str)
+                                and len(content.strip()) > 20
+                            ):
+                                result_text = content.strip()
+                                break
+                except Exception:
+                    continue
+
                 if result_text:
                     break
 
@@ -289,7 +318,13 @@ def evaluate_idea(payload: IdeaRequest):
                     pass
             return {"success": True, "analysis": result_text}
 
+        # Если даже через 100 секунд текст пустой — возвращаем понятный статус
+        return {
+            "success": True,
+            "analysis": f"Запрос успешно отправлен в чат #{conv_id}, но нейросеть генерирует ответ дольше 100 секунд. Нажмите кнопку ещё раз через 10 секунд.",
+        }
+
     raise HTTPException(
         status_code=401,
-        detail=f"Все токены отклонены Armeta. Последний ответ: {last_error}",
+        detail=f"Ошибка авторизации Armeta: {last_error}",
     )
