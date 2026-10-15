@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Startup Feasibility & Cost Audit</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
+    <header class="border-b border-slate-800 bg-slate-900/50 px-6 py-4 flex items-center justify-between">
+        <div>
+            <h1 class="text-xl font-bold text-white tracking-wide">Startup Feasibility & Cost Audit</h1>
+            <p class="text-xs text-slate-400">Проанализировать идею</p>
+        </div>
+        <div
+            class="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-950/50 border border-emerald-800 px-3 py-1 rounded-full">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            Статус: Онлайн
+        </div>
+    </header>
+
+    <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Левая колонка: Ввод -->
+        <div class="flex flex-col gap-4 bg-slate-900 border border-slate-800 p-6 rounded-xl">
+            <h2 class="text-lg font-semibold text-white">Описание концепции</h2>
+            <div class="flex gap-2 flex-wrap">
+                <button onclick="setTemplate('saas')"
+                    class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-slate-700 transition">Шаблон:
+                    B2B SaaS</button>
+                <button onclick="setTemplate('marketplace')"
+                    class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-slate-700 transition">Шаблон:
+                    Маркетплейс</button>
+            </div>
+
+            <textarea id="ideaInput"
+                class="w-full flex-1 min-h-[300px] bg-slate-950 border border-slate-800 rounded-lg p-4 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 resize-none"
+                placeholder="Опишите стартап: целевая аудитория, проблема, ключевые фичи, монетизация и какие специалисты понадобятся..."></textarea>
+
+            <button id="submitBtn" onclick="sendIdea()"
+                class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-3 rounded-lg flex items-center justify-center gap-2 transition disabled:opacity-50">
+                <span>Проанализировать идею</span>
+            </button>
+        </div>
+
+        <!-- Правая колонка: Вывод -->
+        <div class="flex flex-col bg-slate-900 border border-slate-800 p-6 rounded-xl overflow-hidden">
+            <div class="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+                <h2 class="text-lg font-semibold text-white">Экспертное заключение</h2>
+                <button onclick="copyOutput()" id="copyBtn"
+                    class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-slate-700 transition hidden">Копировать</button>
+            </div>
+
+            <div id="outputContainer" class="flex-1 overflow-y-auto pr-2 text-slate-300 text-sm leading-relaxed">
+                <div id="emptyState"
+                    class="h-full flex flex-col items-center justify-center text-slate-500 text-center">
+                    <p>Введите идею слева и нажмите кнопку расчета.</p>
+                </div>
+                <div id="loadingState" class="h-full flex flex-col items-center justify-center gap-3 hidden">
+                    <div class="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin">
+                    </div>
+                    <p class="text-sm text-slate-400">Думаю...</p>
+                </div>
+                <div id="resultContent" class="prose prose-invert max-w-none hidden"></div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function setTemplate(type) {
+            const input = document.getElementById('ideaInput');
+            if (type === 'saas') {
+                input.value = "B2B SaaS платформа для автоматизации документооборота в логистических компаниях. Монетизация: подписка от 50$/мес. Нужен бэкенд на Python, веб-интерфейс, интеграция с 1С.";
+            } else {
+                input.value = "Маркетплейс аренды специализированной строительной техники между физлицами и компаниями. Комиссия 10% с каждой сделки. Мобильное приложение для водителей и веб-кабинет.";
+            }
+        }
+
+        async function sendIdea() {
+            const idea = document.getElementById('ideaInput').value.trim();
+            if (!idea) return alert("Введите описание идеи!");
+
+            const btn = document.getElementById('submitBtn');
+            const emptyState = document.getElementById('emptyState');
+            const loadingState = document.getElementById('loadingState');
+            const resultContent = document.getElementById('resultContent');
+            const copyBtn = document.getElementById('copyBtn');
+
+            btn.disabled = true;
+            emptyState.classList.add('hidden');
+            resultContent.classList.add('hidden');
+            loadingState.classList.remove('hidden');
+
+            try {
+                const response = await fetch('/api/evaluate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ idea: idea })
+                });
+
+                const data = await response.json();
+                loadingState.classList.add('hidden');
+
+                if (response.ok && data.success) {
+                    resultContent.innerHTML = marked.parse(data.analysis);
+                    resultContent.classList.remove('hidden');
+                    copyBtn.classList.remove('hidden');
+                } else {
+                    resultContent.innerHTML = `<p class="text-red-400">Ошибка: ${data.detail || data.analysis || 'Не удалось получить ответ'}</p>`;
+                    resultContent.classList.remove('hidden');
+                }
+            } catch (err) {
+                loadingState.classList.add('hidden');
+                resultContent.innerHTML = `<p class="text-red-400">Не удалось связаться с сервером. Пожалуйста, повторите попытку позже.</p>`;
+                resultContent.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function copyOutput() {
+            const content = document.getElementById('resultContent').innerText;
+            navigator.clipboard.writeText(content).then(() => alert("Отчет скопирован!"));
+        }
+    </script>
+</body>
+
+</html>
