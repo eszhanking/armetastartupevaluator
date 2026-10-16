@@ -85,7 +85,7 @@ def execute_auth_attempt(login: str, password: str):
     attempts_log = []
 
     for url in auth_urls:
-        # 1. Формат Form-Urlencoded
+        # Form-urlencoded
         try:
             form_headers = dict(base_headers)
             form_headers["content-type"] = "application/x-www-form-urlencoded"
@@ -117,7 +117,7 @@ def execute_auth_attempt(login: str, password: str):
                 {"url": url, "type": "form", "error": str(e)[:100]}
             )
 
-        # 2. Формат JSON
+        # JSON
         try:
             json_headers = dict(base_headers)
             json_headers["content-type"] = "application/json"
@@ -203,45 +203,24 @@ def get_candidate_tokens() -> list[str]:
 
 
 def create_fresh_conversation(headers: dict) -> int | None:
-    """Создает изолированный новый чат, сбрасывая историю диалога."""
-    for payload in [{}, {"title": "Аудит идеи"}]:
+    """Создает новый диалог, сбрасывая историю прошлых отказов."""
+    for payload in [{}, {"title": "Аудит проекта"}, {"name": "Аудит проекта"}]:
         try:
             resp = requests.post(
                 "https://smeta.armeta.kz/api/assistant/conversations",
                 headers=headers,
                 json=payload,
-                timeout=8,
+                timeout=7,
             )
             if resp.status_code in [200, 201]:
                 data = resp.json()
-                cid = data.get("id") or data.get("conversation_id")
-                if cid:
-                    return int(cid)
+                if isinstance(data, dict):
+                    cid = data.get("id") or data.get("conversation_id")
+                    if cid:
+                        return int(cid)
         except Exception:
             continue
     return None
-
-
-def extract_piece_from_sse(raw_data: str) -> str:
-    """Извлекает токены из SSE-потока Armeta."""
-    try:
-        chunk = json.loads(raw_data)
-        if isinstance(chunk, str):
-            return chunk
-        if isinstance(chunk, dict):
-            for key in ("content", "delta", "text", "token", "message"):
-                val = chunk.get(key)
-                if isinstance(val, str) and val:
-                    return val
-                if isinstance(val, dict):
-                    nested = val.get("content") or val.get("text")
-                    if isinstance(nested, str) and nested:
-                        return nested
-        return ""
-    except Exception:
-        if not raw_data.startswith("{") and not raw_data.startswith("["):
-            return raw_data
-        return ""
 
 
 @app.get("/")
@@ -311,6 +290,7 @@ def evaluate_idea(payload: IdeaRequest):
         except Exception:
             pass
 
+    # Исходный рабочий системный промпт
     masked_prompt = f"""Ты — продуктовый аналитик и технический архитектор IT-стартапов.
 Проведи качественный продуктово-технический разбор идеи и гипотез проекта.
 
@@ -356,7 +336,7 @@ def evaluate_idea(payload: IdeaRequest):
     for token in candidates:
         headers = make_headers(token)
 
-        # 1. Создаем свежий изолированный диалог
+        # 1. Принудительно создаем новый изолированный чат
         conv_id = create_fresh_conversation(headers)
         if not conv_id:
             fresh = login_armeta()
@@ -368,7 +348,7 @@ def evaluate_idea(payload: IdeaRequest):
         if not conv_id:
             conv_id = 1283
 
-        # 2. Отправляем запрос на создание сообщения
+        # 2. Отправляем запрос на генерацию
         msg_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/messages"
         try:
             post_resp = requests.post(
@@ -395,82 +375,90 @@ def evaluate_idea(payload: IdeaRequest):
 
         target_assistant_id = None
         if post_resp.status_code in [200, 201]:
-            post_json = post_resp.json()
-            target_assistant_id = post_json.get("assistant_message_id")
-            if (
-                isinstance(post_json.get("content"), str)
-                and post_json.get("content") != masked_prompt
-            ):
-                return {"success": True, "analysis": post_json["content"]}
+            try:
+                post_json = post_resp.json()
+                target_assistant_id = post_json.get("assistant_message_id")
+                # Если бэкенд сразу вернул готовый текст
+                if (
+                    isinstance(post_json.get("content"), str)
+                    and post_json.get("content") != masked_prompt
+                    and len(post_json.get("content", "")) > 50
+                ):
+                    return {"success": True, "analysis": post_json["content"]}
+            except Exception:
+                pass
 
-        # 3. Подключаемся к SSE-стриму для запуска генерации на сервере
-        stream_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/stream"
-        collected_chunks = []
-        try:
-            with requests.get(
-                stream_url, headers=headers, stream=True, timeout=30
-            ) as stream_resp:
-                if stream_resp.status_code == 200:
-                    for line in stream_resp.iter_lines():
-                        if not line:
+        # 3. Прямой опрос истории диалога (до 48 секунд: 24 проверки по 2 сек)
+        conversation_url = (
+            f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
+        )
+        result_text = ""
+        poll_debug_info = ""
+
+        for poll_i in range(24):
+            time.sleep(2)
+            try:
+                g_resp = requests.get(
+                    conversation_url, headers=headers, timeout=10
+                )
+                poll_debug_info = f"poll_status={g_resp.status_code}"
+                if g_resp.status_code == 200:
+                    raw_data = g_resp.json()
+
+                    # Безопасно парсим и список, и словарь
+                    if isinstance(raw_data, list):
+                        messages = raw_data
+                    elif isinstance(raw_data, dict):
+                        messages = (
+                            raw_data.get("messages")
+                            or raw_data.get("items")
+                            or raw_data.get("history")
+                            or []
+                        )
+                        if not isinstance(messages, list):
+                            messages = []
+                    else:
+                        messages = []
+
+                    poll_debug_info += f", msgs_count={len(messages)}"
+
+                    for msg in reversed(messages):
+                        if not isinstance(msg, dict):
                             continue
-                        decoded = line.decode("utf-8", errors="ignore").strip()
-                        if decoded.startswith("data:"):
-                            raw = decoded[5:].strip()
-                            if raw == "[DONE]":
-                                break
-                            part = extract_piece_from_sse(raw)
-                            if part:
-                                collected_chunks.append(part)
-        except Exception:
-            pass
 
-        result_text = "".join(collected_chunks).strip()
+                        content = msg.get("content", "")
+                        if not isinstance(content, str):
+                            continue
 
-        # 4. Если стрим отдал не весь текст, опрашиваем историю диалога
-        if not result_text or len(result_text) < 40:
-            conversation_url = (
-                f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
-            )
-            for _ in range(12):
-                time.sleep(1.5)
-                try:
-                    g_resp = requests.get(
-                        conversation_url, headers=headers, timeout=8
-                    )
-                    if g_resp.status_code == 200:
-                        messages = g_resp.json().get("messages", [])
-                        for msg in reversed(messages):
-                            content = msg.get("content", "")
-                            if not isinstance(content, str):
-                                continue
+                        # Отсекаем только стандартное приветствие сметчика
+                        lower_c = content.lower()
+                        if (
+                            "здравствуйте! я ассистент по сметному ценообразованию"
+                            in lower_c
+                            or "armeta смета" in lower_c
+                        ):
+                            continue
 
-                            # Отсекаем только стартовое приветствие
-                            if (
-                                "здравствуйте! я ассистент по сметному ценообразованию"
-                                in content.lower()
-                            ):
-                                continue
+                        # Проверяем совпадение ID либо роль assistant
+                        is_target = target_assistant_id and str(
+                            msg.get("id")
+                        ) == str(target_assistant_id)
+                        is_assistant = msg.get("role") == "assistant"
 
-                            is_target = (
-                                target_assistant_id
-                                and msg.get("id") == target_assistant_id
-                            )
-                            is_assistant = msg.get("role") == "assistant"
+                        if (
+                            is_target or is_assistant
+                        ) and len(content.strip()) > 30:
+                            result_text = content.strip()
+                            break
+            except Exception as e:
+                poll_debug_info = f"poll_exception={str(e)[:80]}"
+                continue
 
-                            if (
-                                is_target or is_assistant
-                            ) and len(content.strip()) > 40:
-                                result_text = content.strip()
-                                break
-                except Exception:
-                    continue
+            # Если ответ получен — сразу прерываем цикл и отдаем результат
+            if result_text:
+                break
 
-                if result_text:
-                    break
-
-        # Проверяем и возвращаем результат
-        if result_text and len(result_text) > 30:
+        if result_text:
             if redis:
                 try:
                     redis.set(cache_key, result_text, ex=259200)
@@ -478,9 +466,7 @@ def evaluate_idea(payload: IdeaRequest):
                     pass
             return {"success": True, "analysis": result_text}
 
-        last_error_details = (
-            "Стрим и опрос завершились, но нейросеть не вернула текст ответа"
-        )
+        last_error_details = f"Ответ не успел сгенерироваться за 48с (чат #{conv_id}, {poll_debug_info})"
 
     raise HTTPException(
         status_code=504,
