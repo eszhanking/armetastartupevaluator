@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
-app = FastAPI(title="Armeta Production Proxy with Auto-Auth")
+app = FastAPI(title="Armeta Fast SSE Proxy")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,15 +39,8 @@ def make_headers(raw_token: str):
         "content-type": "application/json",
         "cookie": COOKIES_STR,
         "origin": "https://smeta.armeta.kz",
-        "priority": "u=1, i",
         "referer": "https://smeta.armeta.kz/chat",
-        "sec-ch-ua": '"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
-        "sec-ch-ua-mobile": "?1",
-        "sec-ch-ua-platform": '"Android"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
 
@@ -67,13 +60,11 @@ def get_redis():
 
 
 def execute_auth_attempt(login: str, password: str):
-    """Пробует варианты эндпоинтов и форматов авторизации Armeta."""
     auth_urls = [
         "https://smeta.armeta.kz/api/auth/jwt/login",
         "https://smeta.armeta.kz/api/auth/login",
         "https://smeta.armeta.kz/api/auth/token",
         "https://smeta.armeta.kz/api/token",
-        "https://smeta.armeta.kz/api/v1/auth/login",
     ]
 
     base_headers = {
@@ -83,10 +74,8 @@ def execute_auth_attempt(login: str, password: str):
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-    attempts_log = []
-
     for url in auth_urls:
-        # 1. Попытка через Form-Urlencoded (FastAPI OAuth2)
+        # Form
         try:
             form_headers = dict(base_headers)
             form_headers["content-type"] = "application/x-www-form-urlencoded"
@@ -96,14 +85,6 @@ def execute_auth_attempt(login: str, password: str):
                 data={"username": login, "password": password},
                 timeout=8,
             )
-            attempts_log.append(
-                {
-                    "url": url,
-                    "type": "form",
-                    "status": resp.status_code,
-                    "text": resp.text[:120],
-                }
-            )
             if resp.status_code in [200, 201]:
                 data = resp.json()
                 tok = (
@@ -112,13 +93,11 @@ def execute_auth_attempt(login: str, password: str):
                     or data.get("jwt")
                 )
                 if tok:
-                    return clean_jwt(tok), attempts_log
-        except Exception as e:
-            attempts_log.append(
-                {"url": url, "type": "form", "error": str(e)[:100]}
-            )
+                    return clean_jwt(tok)
+        except Exception:
+            pass
 
-        # 2. Попытка через JSON
+        # JSON
         try:
             json_headers = dict(base_headers)
             json_headers["content-type"] = "application/json"
@@ -129,44 +108,28 @@ def execute_auth_attempt(login: str, password: str):
                 resp = requests.post(
                     url, headers=json_headers, json=payload, timeout=8
                 )
-                attempts_log.append(
-                    {
-                        "url": url,
-                        "type": "json",
-                        "status": resp.status_code,
-                        "text": resp.text[:120],
-                    }
-                )
                 if resp.status_code in [200, 201]:
                     data = resp.json()
                     tok = (
                         data.get("token")
                         or data.get("access_token")
                         or data.get("jwt")
-                        or (
-                            data.get("data", {}).get("token")
-                            if isinstance(data.get("data"), dict)
-                            else None
-                        )
                     )
                     if tok:
-                        return clean_jwt(tok), attempts_log
-        except Exception as e:
-            attempts_log.append(
-                {"url": url, "type": "json", "error": str(e)[:100]}
-            )
+                        return clean_jwt(tok)
+        except Exception:
+            pass
 
-    return None, attempts_log
+    return None
 
 
 def login_armeta() -> str | None:
     login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
     password = os.getenv("ARMETA_PASSWORD")
-
     if not login or not password:
         return None
 
-    tok, _ = execute_auth_attempt(login, password)
+    tok = execute_auth_attempt(login, password)
     if tok:
         redis = get_redis()
         if redis:
@@ -179,29 +142,25 @@ def login_armeta() -> str | None:
 
 def get_candidate_tokens() -> list[str]:
     candidates = []
-
-    # 1. Токен из кэша Redis
     redis = get_redis()
     if redis:
         try:
             saved = redis.get("armeta_active_token")
             if saved:
-                saved_clean = clean_jwt(str(saved))
-                if saved_clean:
-                    candidates.append(saved_clean)
+                c = clean_jwt(str(saved))
+                if c:
+                    candidates.append(c)
         except Exception:
             pass
 
-    # 2. Авто-логин по логину и паролю
     if not candidates:
-        fresh_token = login_armeta()
-        if fresh_token:
-            candidates.append(fresh_token)
+        fresh = login_armeta()
+        if fresh:
+            candidates.append(fresh)
 
-    # 3. Резервный токен из Vercel Environment Variables
-    env_token = clean_jwt(os.getenv("ARMETA_FALLBACK_TOKEN", ""))
-    if env_token and env_token not in candidates:
-        candidates.append(env_token)
+    env_tok = clean_jwt(os.getenv("ARMETA_FALLBACK_TOKEN", ""))
+    if env_tok and env_tok not in candidates:
+        candidates.append(env_tok)
 
     return candidates
 
@@ -234,60 +193,6 @@ def get_index():
         if os.path.exists(abs_p):
             return FileResponse(abs_p)
     return JSONResponse({"status": "API is running"})
-
-
-@app.get("/api/debug-auth")
-def debug_auth():
-    login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
-    password = os.getenv("ARMETA_PASSWORD")
-
-    if not login or not password:
-        return {
-            "error": "Переменные не найдены в процессе!",
-            "ARMETA_EMAIL_found": bool(os.getenv("ARMETA_EMAIL")),
-            "ARMETA_LOGIN_found": bool(os.getenv("ARMETA_LOGIN")),
-            "ARMETA_PASSWORD_found": bool(os.getenv("ARMETA_PASSWORD")),
-        }
-
-    tok, logs = execute_auth_attempt(login, password)
-    return {
-        "success": bool(tok),
-        "login_used": f"{login[:3]}***{login[-4:]}" if len(login) > 7 else "***",
-        "token_received": f"{tok[:15]}...{tok[-10:]}" if tok else None,
-        "attempts_log": logs,
-    }
-
-
-@app.get("/api/status")
-def check_status():
-    candidates = get_candidate_tokens()
-    results = []
-    for idx, tok in enumerate(candidates):
-        headers = make_headers(tok)
-        try:
-            r = requests.get(
-                "https://smeta.armeta.kz/api/assistant/conversations/1283",
-                headers=headers,
-                timeout=10,
-            )
-            results.append(
-                {
-                    "token_index": idx,
-                    "token_preview": f"{tok[:15]}...{tok[-10:]}",
-                    "armeta_status_code": r.status_code,
-                    "is_working": r.status_code == 200,
-                }
-            )
-        except Exception as e:
-            results.append({"token_index": idx, "error": str(e)})
-    return {
-        "has_credentials": bool(
-            (os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN"))
-            and os.getenv("ARMETA_PASSWORD")
-        ),
-        "candidates_count": len(candidates),
-        "checks": results,
-    }
 
 
 class IdeaRequest(BaseModel):
@@ -345,34 +250,49 @@ def evaluate_idea(payload: IdeaRequest):
     candidates = get_candidate_tokens()
     if not candidates:
         raise HTTPException(
-            status_code=500,
-            detail="Не удалось получить токен авторизации. Проверьте /api/debug-auth",
+            status_code=500, detail="Ошибка авторизации: токены отсутствуют."
         )
 
-    last_error = "Неизвестная ошибка при отправке"
+    last_error = ""
 
     for token in candidates:
         headers = make_headers(token)
-        conv_id = 1283
-        msg_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/messages"
 
+        # 1. Создаем НОВЫЙ чистый диалог, чтобы исключить конфликты и очереди старого чата
+        conv_id = 1283
+        try:
+            c_resp = requests.post(
+                "https://smeta.armeta.kz/api/assistant/conversations",
+                headers=headers,
+                json={},
+                timeout=8,
+            )
+            if c_resp.status_code in [200, 201]:
+                conv_id = c_resp.json().get("id", 1283)
+        except Exception:
+            pass
+
+        # 2. Отправляем промпт
+        msg_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/messages"
         post_resp = requests.post(
-            msg_url, headers=headers, json=request_data, timeout=25
+            msg_url, headers=headers, json=request_data, timeout=20
         )
 
-        # Если 401 — экстренный повторный вход
         if post_resp.status_code == 401:
             fresh_token = login_armeta()
             if fresh_token:
                 token = fresh_token
                 headers = make_headers(token)
                 post_resp = requests.post(
-                    msg_url, headers=headers, json=request_data, timeout=25
+                    msg_url, headers=headers, json=request_data, timeout=20
                 )
 
-        if post_resp.status_code == 409:
-            target_assistant_id = None
-        elif post_resp.status_code in [200, 201]:
+        if post_resp.status_code not in [200, 201, 409]:
+            last_error = f"HTTP {post_resp.status_code}: {post_resp.text}"
+            continue
+
+        target_assistant_id = None
+        if post_resp.status_code in [200, 201]:
             post_json = post_resp.json()
             target_assistant_id = post_json.get("assistant_message_id")
             if (
@@ -380,66 +300,72 @@ def evaluate_idea(payload: IdeaRequest):
                 and post_json.get("content") != masked_prompt
             ):
                 return {"success": True, "analysis": post_json["content"]}
-        else:
-            last_error = f"HTTP {post_resp.status_code}: {post_resp.text}"
-            continue
 
-        conversation_url = (
-            f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
-        )
-        result_text = ""
+        # 3. Быстрый сбор через SSE-стриминг (ответ приходит на лету)
+        stream_url = f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}/stream"
+        collected_chunks = []
+        try:
+            with requests.get(
+                stream_url, headers=headers, stream=True, timeout=30
+            ) as stream_resp:
+                if stream_resp.status_code == 200:
+                    for line in stream_resp.iter_lines():
+                        if not line:
+                            continue
+                        decoded = line.decode("utf-8", errors="ignore").strip()
+                        if decoded.startswith("data:"):
+                            raw = decoded[5:].strip()
+                            if raw == "[DONE]":
+                                break
+                            part = extract_piece_from_sse(raw)
+                            if part:
+                                collected_chunks.append(part)
+        except Exception:
+            pass
 
-        # Опрашиваем историю: генерация занимает 20-35 сек (22 попытки по 2 сек = 44 сек)
-        for _ in range(22):
-            time.sleep(2)
-            try:
-                g_resp = requests.get(
-                    conversation_url, headers=headers, timeout=12
-                )
-                if g_resp.status_code == 200:
-                    data = g_resp.json()
-                    messages = (
-                        data.get("messages", [])
-                        if isinstance(data, dict)
-                        else data
+        result_text = "".join(collected_chunks).strip()
+
+        # 4. Если стрим не вернул данные, добираем из истории диалога
+        if not result_text or len(result_text) < 60:
+            conversation_url = (
+                f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
+            )
+            for _ in range(12):
+                time.sleep(1.5)
+                try:
+                    g_resp = requests.get(
+                        conversation_url, headers=headers, timeout=8
                     )
+                    if g_resp.status_code == 200:
+                        messages = g_resp.json().get("messages", [])
+                        for msg in reversed(messages):
+                            content = msg.get("content", "")
+                            if not isinstance(content, str):
+                                continue
+                            if (
+                                "ассистент по сметному ценообразованию"
+                                in content.lower()
+                            ):
+                                continue
 
-                    # Если последнее сообщение еще от пользователя, нейросеть продолжает писать
-                    if messages and messages[-1].get("role") == "user":
-                        continue
+                            is_target = (
+                                target_assistant_id
+                                and msg.get("id") == target_assistant_id
+                            )
+                            is_assistant = msg.get("role") == "assistant"
 
-                    for msg in reversed(messages):
-                        content = msg.get("content", "")
-                        if not isinstance(content, str):
-                            continue
+                            if (
+                                is_target or is_assistant
+                            ) and len(content.strip()) > 60:
+                                result_text = content.strip()
+                                break
+                except Exception:
+                    continue
 
-                        # 1. Отсекаем стандартное системное приветствие сметчика
-                        lower_c = content.lower()
-                        if (
-                            "ассистент по сметному ценообразованию" in lower_c
-                            or "база рснб" in lower_c
-                            or "с чего начнём" in lower_c
-                            or "armeta смета" in lower_c
-                        ):
-                            continue
+                if result_text:
+                    break
 
-                        # 2. Проверяем совпадение по ID ответа или роль assistant
-                        is_target = (
-                            target_assistant_id
-                            and msg.get("id") == target_assistant_id
-                        )
-                        is_assistant = msg.get("role") == "assistant"
-
-                        if (is_target or is_assistant) and len(content.strip()) > 60:
-                            result_text = content.strip()
-                            break
-            except Exception:
-                continue
-
-            if result_text:
-                break
-
-        if result_text:
+        if result_text and len(result_text) > 60:
             if redis:
                 try:
                     redis.set(cache_key, result_text, ex=259200)
@@ -447,14 +373,7 @@ def evaluate_idea(payload: IdeaRequest):
                     pass
             return {"success": True, "analysis": result_text}
 
-        # Если запрос ушел успешно, но генерация длится дольше тайм-аута
-        if post_resp.status_code in [200, 201]:
-            raise HTTPException(
-                status_code=504,
-                detail="Нейросеть генерирует ответ дольше 45 секунд. Повторите запрос через 5 секунд — ответ уже будет сохранен.",
-            )
-
     raise HTTPException(
-        status_code=401,
-        detail=f"Ошибка авторизации Armeta: {last_error}",
+        status_code=504,
+        detail="Сервер Armeta не успел сформировать ответ за отведенное время. Нажмите кнопку еще раз — диалог подхватит результат из кэша.",
     )
