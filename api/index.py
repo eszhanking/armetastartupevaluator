@@ -67,7 +67,7 @@ def get_redis():
 
 
 def execute_auth_attempt(login: str, password: str):
-    """Пробует популярные варианты эндпоинтов и форматов авторизации Armeta."""
+    """Пробует варианты эндпоинтов и форматов авторизации Armeta."""
     auth_urls = [
         "https://smeta.armeta.kz/api/auth/jwt/login",
         "https://smeta.armeta.kz/api/auth/login",
@@ -86,7 +86,7 @@ def execute_auth_attempt(login: str, password: str):
     attempts_log = []
 
     for url in auth_urls:
-        # 1. Попытка через Form-Urlencoded (стандарт OAuth2 / FastAPI)
+        # 1. Попытка через Form-Urlencoded (FastAPI OAuth2)
         try:
             form_headers = dict(base_headers)
             form_headers["content-type"] = "application/x-www-form-urlencoded"
@@ -160,7 +160,6 @@ def execute_auth_attempt(login: str, password: str):
 
 
 def login_armeta() -> str | None:
-    # Поддерживаем и ARMETA_EMAIL, и ARMETA_LOGIN
     login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
     password = os.getenv("ARMETA_PASSWORD")
 
@@ -181,7 +180,7 @@ def login_armeta() -> str | None:
 def get_candidate_tokens() -> list[str]:
     candidates = []
 
-    # 1. Из Redis
+    # 1. Токен из кэша Redis
     redis = get_redis()
     if redis:
         try:
@@ -193,13 +192,13 @@ def get_candidate_tokens() -> list[str]:
         except Exception:
             pass
 
-    # 2. Авто-логин
+    # 2. Авто-логин по логину и паролю
     if not candidates:
         fresh_token = login_armeta()
         if fresh_token:
             candidates.append(fresh_token)
 
-    # 3. Резервный из Vercel
+    # 3. Резервный токен из Vercel Environment Variables
     env_token = clean_jwt(os.getenv("ARMETA_FALLBACK_TOKEN", ""))
     if env_token and env_token not in candidates:
         candidates.append(env_token)
@@ -239,7 +238,6 @@ def get_index():
 
 @app.get("/api/debug-auth")
 def debug_auth():
-    """Диагностика: проверяет видимость переменных и ответы эндпоинтов Armeta."""
     login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
     password = os.getenv("ARMETA_PASSWORD")
 
@@ -362,7 +360,7 @@ def evaluate_idea(payload: IdeaRequest):
             msg_url, headers=headers, json=request_data, timeout=25
         )
 
-        # Если 401 — экстренный ре-логин
+        # Если 401 — экстренный повторный вход
         if post_resp.status_code == 401:
             fresh_token = login_armeta()
             if fresh_token:
@@ -391,7 +389,8 @@ def evaluate_idea(payload: IdeaRequest):
         )
         result_text = ""
 
-        for _ in range(17):
+        # Опрашиваем историю: генерация занимает 20-35 сек (22 попытки по 2 сек = 44 сек)
+        for _ in range(22):
             time.sleep(2)
             try:
                 g_resp = requests.get(
@@ -404,19 +403,34 @@ def evaluate_idea(payload: IdeaRequest):
                         if isinstance(data, dict)
                         else data
                     )
+
+                    # Если последнее сообщение еще от пользователя, нейросеть продолжает писать
+                    if messages and messages[-1].get("role") == "user":
+                        continue
+
                     for msg in reversed(messages):
+                        content = msg.get("content", "")
+                        if not isinstance(content, str):
+                            continue
+
+                        # 1. Отсекаем стандартное системное приветствие сметчика
+                        lower_c = content.lower()
+                        if (
+                            "ассистент по сметному ценообразованию" in lower_c
+                            or "база рснб" in lower_c
+                            or "с чего начнём" in lower_c
+                            or "armeta смета" in lower_c
+                        ):
+                            continue
+
+                        # 2. Проверяем совпадение по ID ответа или роль assistant
                         is_target = (
                             target_assistant_id
                             and msg.get("id") == target_assistant_id
                         )
                         is_assistant = msg.get("role") == "assistant"
-                        content = msg.get("content")
 
-                        if (
-                            (is_target or is_assistant)
-                            and isinstance(content, str)
-                            and len(content.strip()) > 30
-                        ):
+                        if (is_target or is_assistant) and len(content.strip()) > 60:
                             result_text = content.strip()
                             break
             except Exception:
@@ -432,6 +446,13 @@ def evaluate_idea(payload: IdeaRequest):
                 except Exception:
                     pass
             return {"success": True, "analysis": result_text}
+
+        # Если запрос ушел успешно, но генерация длится дольше тайм-аута
+        if post_resp.status_code in [200, 201]:
+            raise HTTPException(
+                status_code=504,
+                detail="Нейросеть генерирует ответ дольше 45 секунд. Повторите запрос через 5 секунд — ответ уже будет сохранен.",
+            )
 
     raise HTTPException(
         status_code=401,
