@@ -66,45 +66,80 @@ def get_redis():
     return None
 
 
-def login_armeta() -> str | None:
-    """Выполняет вход по логину и паролю, получает свежий JWT и сохраняет в Redis."""
-    login = os.getenv("ARMETA_LOGIN")
-    password = os.getenv("ARMETA_PASSWORD")
-
-    if not login or not password:
-        return None
-
+def execute_auth_attempt(login: str, password: str):
+    """Пробует популярные варианты эндпоинтов и форматов авторизации Armeta."""
     auth_urls = [
+        "https://smeta.armeta.kz/api/auth/jwt/login",
         "https://smeta.armeta.kz/api/auth/login",
-        "https://smeta.armeta.kz/api/auth/signin",
         "https://smeta.armeta.kz/api/auth/token",
+        "https://smeta.armeta.kz/api/token",
         "https://smeta.armeta.kz/api/v1/auth/login",
     ]
 
     base_headers = {
         "accept": "application/json, text/plain, */*",
-        "content-type": "application/json",
         "origin": "https://smeta.armeta.kz",
         "referer": "https://smeta.armeta.kz/login",
-        "user-agent": "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-    # Варианты полезной нагрузки (JSON)
-    payloads = [
-        {"email": login, "password": password},
-        {"login": login, "password": password},
-        {"username": login, "password": password},
-    ]
+    attempts_log = []
 
     for url in auth_urls:
-        for payload in payloads:
-            try:
+        # 1. Попытка через Form-Urlencoded (стандарт OAuth2 / FastAPI)
+        try:
+            form_headers = dict(base_headers)
+            form_headers["content-type"] = "application/x-www-form-urlencoded"
+            resp = requests.post(
+                url,
+                headers=form_headers,
+                data={"username": login, "password": password},
+                timeout=8,
+            )
+            attempts_log.append(
+                {
+                    "url": url,
+                    "type": "form",
+                    "status": resp.status_code,
+                    "text": resp.text[:120],
+                }
+            )
+            if resp.status_code in [200, 201]:
+                data = resp.json()
+                tok = (
+                    data.get("access_token")
+                    or data.get("token")
+                    or data.get("jwt")
+                )
+                if tok:
+                    return clean_jwt(tok), attempts_log
+        except Exception as e:
+            attempts_log.append(
+                {"url": url, "type": "form", "error": str(e)[:100]}
+            )
+
+        # 2. Попытка через JSON
+        try:
+            json_headers = dict(base_headers)
+            json_headers["content-type"] = "application/json"
+            for payload in [
+                {"email": login, "password": password},
+                {"username": login, "password": password},
+            ]:
                 resp = requests.post(
-                    url, headers=base_headers, json=payload, timeout=12
+                    url, headers=json_headers, json=payload, timeout=8
+                )
+                attempts_log.append(
+                    {
+                        "url": url,
+                        "type": "json",
+                        "status": resp.status_code,
+                        "text": resp.text[:120],
+                    }
                 )
                 if resp.status_code in [200, 201]:
                     data = resp.json()
-                    new_token = (
+                    tok = (
                         data.get("token")
                         or data.get("access_token")
                         or data.get("jwt")
@@ -114,28 +149,39 @@ def login_armeta() -> str | None:
                             else None
                         )
                     )
-                    if new_token:
-                        cleaned = clean_jwt(new_token)
-                        redis = get_redis()
-                        if redis:
-                            # Сохраняем на 11 часов (39600 сек)
-                            try:
-                                redis.set(
-                                    "armeta_active_token", cleaned, ex=39600
-                                )
-                            except Exception:
-                                pass
-                        return cleaned
-            except Exception:
-                continue
+                    if tok:
+                        return clean_jwt(tok), attempts_log
+        except Exception as e:
+            attempts_log.append(
+                {"url": url, "type": "json", "error": str(e)[:100]}
+            )
 
-    return None
+    return None, attempts_log
+
+
+def login_armeta() -> str | None:
+    # Поддерживаем и ARMETA_EMAIL, и ARMETA_LOGIN
+    login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
+    password = os.getenv("ARMETA_PASSWORD")
+
+    if not login or not password:
+        return None
+
+    tok, _ = execute_auth_attempt(login, password)
+    if tok:
+        redis = get_redis()
+        if redis:
+            try:
+                redis.set("armeta_active_token", tok, ex=39600)
+            except Exception:
+                pass
+    return tok
 
 
 def get_candidate_tokens() -> list[str]:
     candidates = []
 
-    # 1. Сначала проверяем токен из Redis
+    # 1. Из Redis
     redis = get_redis()
     if redis:
         try:
@@ -147,13 +193,13 @@ def get_candidate_tokens() -> list[str]:
         except Exception:
             pass
 
-    # 2. Если в Redis нет актуального токена, пробуем автоматический логин
+    # 2. Авто-логин
     if not candidates:
         fresh_token = login_armeta()
         if fresh_token:
             candidates.append(fresh_token)
 
-    # 3. Резервный токен из переменных окружения
+    # 3. Резервный из Vercel
     env_token = clean_jwt(os.getenv("ARMETA_FALLBACK_TOKEN", ""))
     if env_token and env_token not in candidates:
         candidates.append(env_token)
@@ -191,6 +237,29 @@ def get_index():
     return JSONResponse({"status": "API is running"})
 
 
+@app.get("/api/debug-auth")
+def debug_auth():
+    """Диагностика: проверяет видимость переменных и ответы эндпоинтов Armeta."""
+    login = os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN")
+    password = os.getenv("ARMETA_PASSWORD")
+
+    if not login or not password:
+        return {
+            "error": "Переменные не найдены в процессе!",
+            "ARMETA_EMAIL_found": bool(os.getenv("ARMETA_EMAIL")),
+            "ARMETA_LOGIN_found": bool(os.getenv("ARMETA_LOGIN")),
+            "ARMETA_PASSWORD_found": bool(os.getenv("ARMETA_PASSWORD")),
+        }
+
+    tok, logs = execute_auth_attempt(login, password)
+    return {
+        "success": bool(tok),
+        "login_used": f"{login[:3]}***{login[-4:]}" if len(login) > 7 else "***",
+        "token_received": f"{tok[:15]}...{tok[-10:]}" if tok else None,
+        "attempts_log": logs,
+    }
+
+
 @app.get("/api/status")
 def check_status():
     candidates = get_candidate_tokens()
@@ -215,7 +284,8 @@ def check_status():
             results.append({"token_index": idx, "error": str(e)})
     return {
         "has_credentials": bool(
-            os.getenv("ARMETA_LOGIN") and os.getenv("ARMETA_PASSWORD")
+            (os.getenv("ARMETA_EMAIL") or os.getenv("ARMETA_LOGIN"))
+            and os.getenv("ARMETA_PASSWORD")
         ),
         "candidates_count": len(candidates),
         "checks": results,
@@ -278,7 +348,7 @@ def evaluate_idea(payload: IdeaRequest):
     if not candidates:
         raise HTTPException(
             status_code=500,
-            detail="Не удалось получить рабочий токен даже через авто-логин. Проверьте ARMETA_LOGIN и ARMETA_PASSWORD.",
+            detail="Не удалось получить токен авторизации. Проверьте /api/debug-auth",
         )
 
     last_error = "Неизвестная ошибка при отправке"
@@ -292,7 +362,7 @@ def evaluate_idea(payload: IdeaRequest):
             msg_url, headers=headers, json=request_data, timeout=25
         )
 
-        # Если 401 — пробуем экстренно перелогиниться на лету
+        # Если 401 — экстренный ре-логин
         if post_resp.status_code == 401:
             fresh_token = login_armeta()
             if fresh_token:
@@ -316,13 +386,11 @@ def evaluate_idea(payload: IdeaRequest):
             last_error = f"HTTP {post_resp.status_code}: {post_resp.text}"
             continue
 
-        # Чтение ответа
         conversation_url = (
             f"https://smeta.armeta.kz/api/assistant/conversations/{conv_id}"
         )
         result_text = ""
 
-        # Ускоренный опрос: до 35 секунд (17 попыток по 2 сек)
         for _ in range(17):
             time.sleep(2)
             try:
